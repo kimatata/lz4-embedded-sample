@@ -7,38 +7,41 @@
 
 #define CHUNK_SIZE 1024 * 8 // 8KB
 
-size_t write_int(FILE *fp, int i) {
-    return fwrite(&i, sizeof(i), 1, fp);
+// pre allocated buffer
+static char decBuf[2][CHUNK_SIZE];
+static char inpBuf[2][CHUNK_SIZE];
+
+static void writeBlockSize(FILE *fp, uint32_t blockSize) {
+    fwrite(&blockSize, sizeof(uint32_t), 1, fp);
 }
 
-size_t write_bin(FILE *fp, const void *array, size_t arrayBytes) {
-    return fwrite(array, 1, arrayBytes, fp);
+static size_t readBlockSize(FILE *fp, uint32_t *blockSize) {
+    return fread(blockSize, sizeof(uint32_t), 1, fp);
 }
 
-size_t read_int(FILE *fp, int *i) {
-    return fread(i, sizeof(*i), 1, fp);
+static void writeCompressedBlock(FILE *fp, const void *array, size_t arrayBytes) {
+    fwrite(array, 1, arrayBytes, fp);
 }
 
-size_t read_bin(FILE *fp, void *array, size_t arrayBytes) {
+static size_t readCompressedBlock(FILE *fp, void *array, size_t arrayBytes) {
     return fread(array, 1, arrayBytes, fp);
 }
 
-void test_compress(FILE *outFp, FILE *inpFp) {
+static void test_compress(FILE *outFp, FILE *inpFp) {
     assert(outFp != NULL);
     assert(inpFp != NULL);
 
     LZ4_stream_t lz4Stream_body;
     LZ4_stream_t *lz4Stream = &lz4Stream_body;
 
-    char inpBuf[2][CHUNK_SIZE];
     int inpBufIndex = 0;
 
     LZ4_initStream(lz4Stream, sizeof(*lz4Stream));
 
     for (;;) {
         char *const inpPtr = inpBuf[inpBufIndex];
-        const int inpBytes = (int)read_bin(inpFp, inpPtr, CHUNK_SIZE);
-        if (0 == inpBytes) {
+        const int inpBytes = (int)readCompressedBlock(inpFp, inpPtr, CHUNK_SIZE);
+        if (inpBytes == 0) {
             break;
         }
 
@@ -48,39 +51,36 @@ void test_compress(FILE *outFp, FILE *inpFp) {
             if (cmpBytes <= 0) {
                 break;
             }
-            write_int(outFp, cmpBytes);
-            write_bin(outFp, cmpBuf, (size_t)cmpBytes);
+            writeBlockSize(outFp, cmpBytes);
+            writeCompressedBlock(outFp, cmpBuf, (size_t)cmpBytes);
         }
 
         inpBufIndex = (inpBufIndex + 1) % 2;
     }
 
-    write_int(outFp, 0);
+    writeBlockSize(outFp, 0);
 }
 
-void test_decompress(FILE *outFp, FILE *inpFp) {
+static void test_decompress(FILE *outFp, FILE *inpFp) {
     assert(outFp != NULL);
     assert(inpFp != NULL);
 
-    LZ4_streamDecode_t lz4StreamDecode_body;
-    LZ4_streamDecode_t *lz4StreamDecode = &lz4StreamDecode_body;
-
-    char decBuf[2][CHUNK_SIZE];
+    LZ4_streamDecode_t *lz4StreamDecode = LZ4_createStreamDecode();
     int decBufIndex = 0;
 
     LZ4_setStreamDecode(lz4StreamDecode, NULL, 0);
 
     for (;;) {
         char cmpBuf[LZ4_COMPRESSBOUND(CHUNK_SIZE)];
-        int cmpBytes = 0;
+        uint32_t cmpBytes = 0;
 
         {
-            const size_t readCount0 = read_int(inpFp, &cmpBytes);
+            const size_t readCount0 = readBlockSize(inpFp, &cmpBytes);
             if (readCount0 != 1 || cmpBytes <= 0) {
                 break;
             }
 
-            const size_t readCount1 = read_bin(inpFp, cmpBuf, (size_t)cmpBytes);
+            const size_t readCount1 = readCompressedBlock(inpFp, cmpBuf, (size_t)cmpBytes);
             if (readCount1 != (size_t)cmpBytes) {
                 break;
             }
@@ -90,16 +90,19 @@ void test_decompress(FILE *outFp, FILE *inpFp) {
             char *const decPtr = decBuf[decBufIndex];
             const int decBytes = LZ4_decompress_safe_continue(lz4StreamDecode, cmpBuf, decPtr, cmpBytes, CHUNK_SIZE);
             if (decBytes <= 0) {
+                printf("Failed to decompress\n");
                 break;
             }
-            write_bin(outFp, decPtr, (size_t)decBytes);
+            writeCompressedBlock(outFp, decPtr, (size_t)decBytes);
         }
 
         decBufIndex = (decBufIndex + 1) % 2;
     }
+
+    LZ4_freeStreamDecode(lz4StreamDecode);
 }
 
-int compare(FILE *fp0, FILE *fp1) {
+static int compare(FILE *fp0, FILE *fp1) {
     int result = 0;
 
     assert(fp0 != NULL);
@@ -108,8 +111,8 @@ int compare(FILE *fp0, FILE *fp1) {
     while (0 == result) {
         char b0[65536];
         char b1[65536];
-        const size_t r0 = read_bin(fp0, b0, sizeof(b0));
-        const size_t r1 = read_bin(fp1, b1, sizeof(b1));
+        const size_t r0 = readCompressedBlock(fp0, b0, sizeof(b0));
+        const size_t r1 = readCompressedBlock(fp1, b1, sizeof(b1));
 
         result = (int)r0 - (int)r1;
 
